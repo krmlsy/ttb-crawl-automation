@@ -1,0 +1,6 @@
+node_modules/
+playwright-report/
+test-results/
+dist/
+data/crawl-results.json
+.DS_Store
