@@ -1,12 +1,18 @@
-import { chromium, type Page } from '@playwright/test';
+import {
+  chromium,
+  type Page,
+} from '@playwright/test';
+
 import fs from 'node:fs/promises';
+
 import path from 'node:path';
-import process from 'node:process';
 
 import type {
+  CrawlEdge,
   CrawlOptions,
   CrawlResult,
   FailedUrlRecord,
+  ResourceType,
   UrlRecord,
 } from './types.js';
 
@@ -15,21 +21,6 @@ type QueueItem = {
   depth: number;
   discoveredFrom: string | null;
 };
-
-const DEFAULT_OUTPUT = 'data/crawl-results.json';
-
-const TRACKING_PARAMS = new Set([
-  'utm_source',
-  'utm_medium',
-  'utm_campaign',
-  'utm_term',
-  'utm_content',
-  'gclid',
-  'fbclid',
-  'msclkid',
-  '_ga',
-  '_gl',
-]);
 
 const IMAGE_EXTENSIONS = [
   '.jpg',
@@ -43,177 +34,182 @@ const IMAGE_EXTENSIONS = [
   '.avif',
 ];
 
-function printUsage(): void {
-  console.log(`
-Usage:
-  npm run crawl -- --url https://example.com
-
-Options:
-  --output <path>
-  Default: ${DEFAULT_OUTPUT}
-
-  --max-pages <n>
-  Default: 1000
-
-  --max-depth <n>
-  Default: 10
-
-  --timeout <ms>
-  Default: 30000
-
-  --include-subdomains <boolean>
-  Default: false
-
-  --ignore-https-errors <boolean>
-  Default: false
-
-Example:
-
-  npm run crawl -- \
-    --url https://www.example.com \
-    --max-pages 2000 \
-    --max-depth 15
-`);
-}
-
 function parseBoolean(
   value: string | undefined,
-  fallback: boolean,
+  defaultValue = false,
 ): boolean {
   if (value === undefined) {
-    return fallback;
+    return defaultValue;
   }
 
-  return ['1', 'true', 'yes', 'y'].includes(
-    value.toLowerCase(),
-  );
+  return [
+    'true',
+    '1',
+    'yes',
+    'y',
+    'on',
+  ].includes(value.toLowerCase());
 }
 
-function parseArgs(argv: string[]): CrawlOptions {
-  const values = new Map<string, string>();
+function getArgument(
+  name: string,
+): string | undefined {
+  const index =
+    process.argv.indexOf(name);
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-
-    if (!arg.startsWith('--')) {
-      continue;
-    }
-
-    const [rawKey, inlineValue] = arg
-      .slice(2)
-      .split('=', 2);
-
-    const next = argv[i + 1];
-
-    const value =
-      inlineValue ??
-      (next && !next.startsWith('--')
-        ? next
-        : 'true');
-
-    values.set(rawKey, value);
-
-    if (
-      inlineValue === undefined &&
-      next &&
-      !next.startsWith('--')
-    ) {
-      i++;
-    }
+  if (
+    index === -1 ||
+    index + 1 >= process.argv.length
+  ) {
+    return undefined;
   }
 
-  const rootUrlRaw = values.get('url');
+  return process.argv[index + 1];
+}
 
-  if (!rootUrlRaw) {
-    printUsage();
-    throw new Error('Missing required parameter: --url');
+function hasArgument(
+  name: string,
+): boolean {
+  return process.argv.includes(name);
+}
+
+function parseOptions(): CrawlOptions {
+  const rootUrl =
+    getArgument('--url');
+
+  if (!rootUrl) {
+    throw new Error(
+      'Missing required argument: --url',
+    );
   }
 
-  const rootUrl = new URL(rootUrlRaw).toString();
+  const output =
+    getArgument('--output') ??
+    path.resolve(
+      process.cwd(),
+      'data',
+      'crawl-results.json',
+    );
+
+  const maxPages = Number(
+    getArgument('--max-pages') ??
+      '500',
+  );
+
+  const maxDepth = Number(
+    getArgument('--max-depth') ??
+      '10',
+  );
+
+  const timeoutMs = Number(
+    getArgument('--timeout') ??
+      '30000',
+  );
+
+  const includeSubdomains =
+    hasArgument(
+      '--include-subdomains',
+    ) ||
+    parseBoolean(
+      process.env
+        .INCLUDE_SUBDOMAINS,
+    );
+
+  /*
+   * Öncelik:
+   *
+   * --ignore-https-errors true
+   *
+   * yoksa:
+   *
+   * IGNORE_HTTPS_ERRORS=true
+   */
+  const ignoreHttpsErrors =
+    getArgument(
+      '--ignore-https-errors',
+    ) !== undefined
+      ? parseBoolean(
+          getArgument(
+            '--ignore-https-errors',
+          ),
+        )
+      : parseBoolean(
+          process.env
+            .IGNORE_HTTPS_ERRORS,
+        );
 
   return {
     rootUrl,
-    output: values.get('output') ?? DEFAULT_OUTPUT,
-    maxPages: Number(values.get('max-pages') ?? 1000),
-    maxDepth: Number(values.get('max-depth') ?? 10),
-    timeoutMs: Number(values.get('timeout') ?? 30_000),
-    includeSubdomains: parseBoolean(
-      values.get('include-subdomains'),
-      false,
-    ),
-    ignoreHttpsErrors: parseBoolean(
-      values.get('ignore-https-errors'),
-      false,
-    ),
+    output,
+    maxPages,
+    maxDepth,
+    timeoutMs,
+    includeSubdomains,
+    ignoreHttpsErrors,
   };
 }
 
-function canonicalHostname(hostname: string): string {
+function canonicalHostname(
+  hostname: string,
+): string {
   return hostname
     .toLowerCase()
     .replace(/^www\./, '');
 }
 
-function isHttpUrl(url: URL): boolean {
-  return (
-    url.protocol === 'http:' ||
-    url.protocol === 'https:'
-  );
-}
-
 function normalizeUrl(
   rawUrl: string,
-  baseUrl?: string,
+  baseUrl: string,
 ): string | null {
   try {
-    const url = baseUrl
-      ? new URL(rawUrl, baseUrl)
-      : new URL(rawUrl);
+    const value =
+      rawUrl.trim();
 
-    if (!isHttpUrl(url)) {
+    if (!value) {
       return null;
     }
 
-    // Fragmentleri kaldır.
+    const lower =
+      value.toLowerCase();
+
+    if (
+      lower.startsWith(
+        'javascript:',
+      ) ||
+      lower.startsWith(
+        'mailto:',
+      ) ||
+      lower.startsWith(
+        'tel:',
+      ) ||
+      lower.startsWith(
+        'data:',
+      ) ||
+      lower.startsWith(
+        'blob:',
+      ) ||
+      lower.startsWith('#')
+    ) {
+      return null;
+    }
+
+    const url = new URL(
+      value,
+      baseUrl,
+    );
+
+    if (
+      url.protocol !== 'http:' &&
+      url.protocol !== 'https:'
+    ) {
+      return null;
+    }
+
+    /*
+     * Sitemap açısından fragment
+     * yeni bir kaynak değildir.
+     */
     url.hash = '';
-
-    // Tracking parametrelerini temizle.
-    for (const key of [...url.searchParams.keys()]) {
-      if (TRACKING_PARAMS.has(key.toLowerCase())) {
-        url.searchParams.delete(key);
-      }
-    }
-
-    // Default portları kaldır.
-    if (
-      (url.protocol === 'https:' && url.port === '443') ||
-      (url.protocol === 'http:' && url.port === '80')
-    ) {
-      url.port = '';
-    }
-
-    // /foo/ => /foo
-    if (
-      url.pathname.length > 1 &&
-      url.pathname.endsWith('/')
-    ) {
-      url.pathname = url.pathname.replace(/\/+$/, '');
-    }
-
-    // Query parametrelerini sıralayarak duplicate azalt.
-    const sortedParams = [...url.searchParams.entries()]
-      .sort(([aKey, aValue], [bKey, bValue]) => {
-        return (
-          aKey.localeCompare(bKey) ||
-          aValue.localeCompare(bValue)
-        );
-      });
-
-    url.search = '';
-
-    for (const [key, value] of sortedParams) {
-      url.searchParams.append(key, value);
-    }
 
     return url.toString();
   } catch {
@@ -222,879 +218,1568 @@ function normalizeUrl(
 }
 
 function isSameSite(
-  candidate: URL,
-  root: URL,
+  candidate: string,
+  rootUrl: URL,
   includeSubdomains: boolean,
 ): boolean {
-  const candidateHost = canonicalHostname(
-    candidate.hostname,
-  );
-
-  const rootHost = canonicalHostname(
-    root.hostname,
-  );
-
-  // www.example.com ve example.com aynı kabul edilir.
-  if (candidateHost === rootHost) {
-    return true;
-  }
-
-  if (!includeSubdomains) {
-    return false;
-  }
-
-  return candidateHost.endsWith(`.${rootHost}`);
-}
-
-function getPathname(url: string): string {
   try {
-    return new URL(url).pathname.toLowerCase();
+    const url =
+      new URL(candidate);
+
+    const candidateHost =
+      canonicalHostname(
+        url.hostname,
+      );
+
+    const rootHost =
+      canonicalHostname(
+        rootUrl.hostname,
+      );
+
+    if (
+      candidateHost ===
+      rootHost
+    ) {
+      return true;
+    }
+
+    if (
+      includeSubdomains &&
+      candidateHost.endsWith(
+        `.${rootHost}`,
+      )
+    ) {
+      return true;
+    }
+
+    return false;
   } catch {
-    return '';
-  }
-}
-
-function looksLikePdf(
-  url: string,
-  contentType = '',
-): boolean {
-  const pathname = getPathname(url);
-
-  return (
-    pathname.endsWith('.pdf') ||
-    contentType
-      .toLowerCase()
-      .includes('application/pdf')
-  );
-}
-
-function looksLikeImage(
-  url: string,
-  contentType = '',
-): boolean {
-  const pathname = getPathname(url);
-
-  const extensionMatch = IMAGE_EXTENSIONS.some(
-    (extension) => pathname.endsWith(extension),
-  );
-
-  const contentTypeMatch = contentType
-    .toLowerCase()
-    .startsWith('image/');
-
-  return extensionMatch || contentTypeMatch;
-}
-
-function isHtmlContentType(
-  contentType: string,
-): boolean {
-  if (!contentType) {
     return false;
   }
+}
 
-  const value = contentType.toLowerCase();
+function isPdfUrl(
+  url: string,
+): boolean {
+  try {
+    return new URL(url)
+      .pathname.toLowerCase()
+      .endsWith('.pdf');
+  } catch {
+    return false;
+  }
+}
 
-  return (
-    value.includes('text/html') ||
-    value.includes('application/xhtml+xml')
-  );
+function isImageUrl(
+  url: string,
+): boolean {
+  try {
+    const pathname =
+      new URL(url)
+        .pathname.toLowerCase();
+
+    return IMAGE_EXTENSIONS.some(
+      (extension) =>
+        pathname.endsWith(
+          extension,
+        ),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function typeFromContentType(
+  contentType: string,
+): ResourceType {
+  const lower =
+    contentType.toLowerCase();
+
+  if (
+    lower.includes(
+      'application/pdf',
+    )
+  ) {
+    return 'pdf';
+  }
+
+  if (
+    lower.startsWith(
+      'image/',
+    )
+  ) {
+    return 'image';
+  }
+
+  if (
+    lower.includes(
+      'text/html',
+    ) ||
+    lower.includes(
+      'application/xhtml+xml',
+    )
+  ) {
+    return 'html';
+  }
+
+  return 'other';
+}
+
+function guessedType(
+  url: string,
+): ResourceType {
+  if (isPdfUrl(url)) {
+    return 'pdf';
+  }
+
+  if (isImageUrl(url)) {
+    return 'image';
+  }
+
+  return 'html';
 }
 
 function uniqueSorted(
-  values: Iterable<string>,
+  values: string[],
 ): string[] {
-  return [...new Set(values)].sort((a, b) =>
+  return [
+    ...new Set(values),
+  ].sort((a, b) =>
     a.localeCompare(b),
   );
-}
-
-/**
- * Sayfanın gerçekten HTML olup olmadığını daha toleranslı kontrol eder.
- *
- * Önce Content-Type'a bakar.
- * Sonra document resource type'a bakar.
- * Son olarak DOM'da <html> olup olmadığını kontrol eder.
- */
-async function isHtmlPage(
-  page: Page,
-  contentType: string,
-  resourceType: string,
-): Promise<boolean> {
-  if (isHtmlContentType(contentType)) {
-    return true;
-  }
-
-  if (resourceType === 'document') {
-    const htmlCount = await page
-      .locator('html')
-      .count()
-      .catch(() => 0);
-
-    if (htmlCount > 0) {
-      return true;
-    }
-  }
-
-  return false;
 }
 
 async function extractLinks(
   page: Page,
   currentUrl: string,
 ): Promise<string[]> {
-  const hrefs = await page
-    .locator('a[href]')
-    .evaluateAll((anchors) => {
-      return anchors
-        .map((anchor) => anchor.getAttribute('href'))
-        .filter(
-          (href): href is string =>
-            Boolean(href && href.trim()),
-        );
-    });
+  const anchors =
+    page.locator('a[href]');
 
-  const normalized = hrefs
-    .map((href) => normalizeUrl(href, currentUrl))
-    .filter((url): url is string => Boolean(url));
+  const count =
+    await anchors.count();
 
-  return uniqueSorted(normalized);
+  const result: string[] = [];
+
+  for (
+    let index = 0;
+    index < count;
+    index++
+  ) {
+    const anchor =
+      anchors.nth(index);
+
+    const href =
+      await anchor
+        .getAttribute('href')
+        .catch(() => null);
+
+    if (!href) {
+      continue;
+    }
+
+    const normalized =
+      normalizeUrl(
+        href,
+        currentUrl,
+      );
+
+    if (normalized) {
+      result.push(
+        normalized,
+      );
+    }
+  }
+
+  return uniqueSorted(
+    result,
+  );
+}
+
+function parseSrcSet(
+  value: string | null,
+): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(',')
+    .map((entry) =>
+      entry
+        .trim()
+        .split(/\s+/)[0],
+    )
+    .filter(Boolean);
 }
 
 async function extractImages(
   page: Page,
   currentUrl: string,
 ): Promise<string[]> {
-  const rawImages = await page
-    .locator(
-      [
-        'img',
-        'source',
-        'meta[property="og:image"]',
-        'meta[name="twitter:image"]',
-        'link[rel~="icon"]',
-        'link[rel="apple-touch-icon"]',
-      ].join(','),
-    )
-    .evaluateAll((elements) => {
-      const result: string[] = [];
+  const result: string[] = [];
 
-      for (const element of elements) {
-        /*
-         * IMG
-         */
-        if (element.tagName.toLowerCase() === 'img') {
-          const img = element as HTMLImageElement;
+  function add(
+    rawUrl:
+      | string
+      | null
+      | undefined,
+  ) {
+    if (!rawUrl) {
+      return;
+    }
 
-          const src = img.getAttribute('src');
-          const currentSrc = img.currentSrc;
-          const dataSrc = img.getAttribute('data-src');
-          const dataLazySrc =
-            img.getAttribute('data-lazy-src');
-          const dataOriginal =
-            img.getAttribute('data-original');
-          const dataImage =
-            img.getAttribute('data-image');
-
-          if (src?.trim()) {
-            result.push(src.trim());
-          }
-
-          if (currentSrc?.trim()) {
-            result.push(currentSrc.trim());
-          }
-
-          if (dataSrc?.trim()) {
-            result.push(dataSrc.trim());
-          }
-
-          if (dataLazySrc?.trim()) {
-            result.push(dataLazySrc.trim());
-          }
-
-          if (dataOriginal?.trim()) {
-            result.push(dataOriginal.trim());
-          }
-
-          if (dataImage?.trim()) {
-            result.push(dataImage.trim());
-          }
-
-          const srcset =
-            img.getAttribute('srcset');
-
-          if (srcset) {
-            for (const item of srcset.split(',')) {
-              const candidate =
-                item.trim().split(/\s+/)[0];
-
-              if (candidate) {
-                result.push(candidate);
-              }
-            }
-          }
-
-          const dataSrcset =
-            img.getAttribute('data-srcset');
-
-          if (dataSrcset) {
-            for (const item of dataSrcset.split(',')) {
-              const candidate =
-                item.trim().split(/\s+/)[0];
-
-              if (candidate) {
-                result.push(candidate);
-              }
-            }
-          }
-        }
-
-        /*
-         * SOURCE / PICTURE
-         */
-        if (
-          element.tagName.toLowerCase() ===
-          'source'
-        ) {
-          const src =
-            element.getAttribute('src');
-
-          if (src?.trim()) {
-            result.push(src.trim());
-          }
-
-          const srcset =
-            element.getAttribute('srcset');
-
-          if (srcset) {
-            for (const item of srcset.split(',')) {
-              const candidate =
-                item.trim().split(/\s+/)[0];
-
-              if (candidate) {
-                result.push(candidate);
-              }
-            }
-          }
-        }
-
-        /*
-         * OG / TWITTER IMAGE
-         */
-        if (
-          element.tagName.toLowerCase() ===
-          'meta'
-        ) {
-          const content =
-            element.getAttribute('content');
-
-          if (content?.trim()) {
-            result.push(content.trim());
-          }
-        }
-
-        /*
-         * FAVICON / APPLE ICON
-         */
-        if (
-          element.tagName.toLowerCase() ===
-          'link'
-        ) {
-          const href =
-            element.getAttribute('href');
-
-          if (href?.trim()) {
-            result.push(href.trim());
-          }
-        }
-      }
-
-      return result;
-    });
-
-  const normalized = rawImages
-    .map((imageUrl) =>
+    const normalized =
       normalizeUrl(
-        imageUrl,
+        rawUrl,
         currentUrl,
-      ),
-    )
-    .filter(
-      (imageUrl): imageUrl is string =>
-        Boolean(imageUrl),
+      );
+
+    if (normalized) {
+      result.push(
+        normalized,
+      );
+    }
+  }
+
+  /*
+   * IMG
+   */
+  const images =
+    page.locator('img');
+
+  const imageCount =
+    await images.count();
+
+  for (
+    let index = 0;
+    index < imageCount;
+    index++
+  ) {
+    const image =
+      images.nth(index);
+
+    add(
+      await image
+        .getAttribute('src')
+        .catch(() => null),
     );
 
-  return uniqueSorted(normalized);
+    add(
+      await image
+        .getAttribute(
+          'data-src',
+        )
+        .catch(() => null),
+    );
+
+    add(
+      await image
+        .getAttribute(
+          'data-lazy-src',
+        )
+        .catch(() => null),
+    );
+
+    add(
+      await image
+        .getAttribute(
+          'data-original',
+        )
+        .catch(() => null),
+    );
+
+    add(
+      await image
+        .getAttribute(
+          'data-image',
+        )
+        .catch(() => null),
+    );
+
+    const srcset =
+      await image
+        .getAttribute(
+          'srcset',
+        )
+        .catch(() => null);
+
+    for (
+      const item of
+      parseSrcSet(srcset)
+    ) {
+      add(item);
+    }
+
+    const dataSrcset =
+      await image
+        .getAttribute(
+          'data-srcset',
+        )
+        .catch(() => null);
+
+    for (
+      const item of
+      parseSrcSet(
+        dataSrcset,
+      )
+    ) {
+      add(item);
+    }
+  }
+
+  /*
+   * PICTURE / SOURCE
+   */
+  const sources =
+    page.locator(
+      'source',
+    );
+
+  const sourceCount =
+    await sources.count();
+
+  for (
+    let index = 0;
+    index < sourceCount;
+    index++
+  ) {
+    const source =
+      sources.nth(index);
+
+    add(
+      await source
+        .getAttribute('src')
+        .catch(() => null),
+    );
+
+    const srcset =
+      await source
+        .getAttribute(
+          'srcset',
+        )
+        .catch(() => null);
+
+    for (
+      const item of
+      parseSrcSet(srcset)
+    ) {
+      add(item);
+    }
+  }
+
+  /*
+   * OpenGraph / Twitter
+   */
+  const metaImages =
+    page.locator(
+      [
+        'meta[property="og:image"]',
+        'meta[property="og:image:url"]',
+        'meta[name="twitter:image"]',
+        'meta[name="twitter:image:src"]',
+      ].join(','),
+    );
+
+  const metaCount =
+    await metaImages.count();
+
+  for (
+    let index = 0;
+    index < metaCount;
+    index++
+  ) {
+    add(
+      await metaImages
+        .nth(index)
+        .getAttribute(
+          'content',
+        )
+        .catch(() => null),
+    );
+  }
+
+  /*
+   * Favicons
+   */
+  const icons =
+    page.locator(
+      [
+        'link[rel~="icon"]',
+        'link[rel="apple-touch-icon"]',
+        'link[rel="apple-touch-icon-precomposed"]',
+      ].join(','),
+    );
+
+  const iconCount =
+    await icons.count();
+
+  for (
+    let index = 0;
+    index < iconCount;
+    index++
+  ) {
+    add(
+      await icons
+        .nth(index)
+        .getAttribute(
+          'href',
+        )
+        .catch(() => null),
+    );
+  }
+
+  return uniqueSorted(
+    result,
+  );
 }
 
-async function crawl(
-  options: CrawlOptions,
-): Promise<CrawlResult> {
-  const root = new URL(options.rootUrl);
+function mergeReferences(
+  existing: string[],
+  incoming: string[],
+): string[] {
+  return uniqueSorted([
+    ...existing,
+    ...incoming,
+  ]);
+}
 
-  console.log('\n================================');
-  console.log(' URL CRAWLER');
-  console.log('================================');
-  console.log(`Root URL   : ${options.rootUrl}`);
-  console.log(`Max pages  : ${options.maxPages}`);
-  console.log(`Max depth  : ${options.maxDepth}`);
-  console.log(
-    `Subdomains : ${options.includeSubdomains}`,
-  );
-  console.log('================================\n');
+async function main() {
+  const options =
+    parseOptions();
 
-  const browser = await chromium.launch({
-    headless: true,
-  });
+  const rootUrl =
+    new URL(
+      options.rootUrl,
+    );
 
-  const context = await browser.newContext({
-    ignoreHTTPSErrors: options.ignoreHttpsErrors,
+  const normalizedRoot =
+    normalizeUrl(
+      options.rootUrl,
+      options.rootUrl,
+    );
 
-    userAgent:
-      'Mozilla/5.0 (compatible; PlaywrightUrlCrawler/1.2)',
-  });
-
-  const page = await context.newPage();
-
-  page.setDefaultNavigationTimeout(
-    options.timeoutMs,
-  );
-
-  const rootNormalized = normalizeUrl(
-    options.rootUrl,
-  );
-
-  if (!rootNormalized) {
+  if (!normalizedRoot) {
     throw new Error(
       `Invalid root URL: ${options.rootUrl}`,
     );
   }
 
-  const queue: QueueItem[] = [
-    {
-      url: rootNormalized,
-      depth: 0,
-      discoveredFrom: null,
-    },
-  ];
+  console.log('');
+  console.log(
+    '================================',
+  );
+  console.log(
+    ' URL CRAWLER',
+  );
+  console.log(
+    '================================',
+  );
+  console.log(
+    `Root URL   : ${normalizedRoot}`,
+  );
+  console.log(
+    `Max pages  : ${options.maxPages}`,
+  );
+  console.log(
+    `Max depth  : ${options.maxDepth}`,
+  );
+  console.log(
+    `Subdomains : ${options.includeSubdomains}`,
+  );
+  console.log(
+    `Ignore TLS : ${options.ignoreHttpsErrors}`,
+  );
+  console.log(
+    '================================',
+  );
+  console.log('');
 
-  const queued = new Set<string>([
-    rootNormalized,
-  ]);
+  const browser =
+    await chromium.launch({
+      headless: true,
+    });
 
-  const visited = new Set<string>();
-  const external = new Set<string>();
+  const context =
+    await browser.newContext({
+      ignoreHTTPSErrors:
+        options.ignoreHttpsErrors,
+    });
 
-  const html = new Map<string, UrlRecord>();
-  const pdf = new Map<string, UrlRecord>();
-  const images = new Map<string, UrlRecord>();
-  const other = new Map<string, UrlRecord>();
-  const failed = new Map<
-    string,
-    FailedUrlRecord
-  >();
+  const page =
+    await context.newPage();
 
-  try {
-    while (
-      queue.length > 0 &&
-      visited.size < options.maxPages
+  page.setDefaultTimeout(
+    options.timeoutMs,
+  );
+
+  page.setDefaultNavigationTimeout(
+    options.timeoutMs,
+  );
+
+  /*
+   * URL → Record
+   */
+  const htmlMap =
+    new Map<
+      string,
+      UrlRecord
+    >();
+
+  const pdfMap =
+    new Map<
+      string,
+      UrlRecord
+    >();
+
+  const imageMap =
+    new Map<
+      string,
+      UrlRecord
+    >();
+
+  const otherMap =
+    new Map<
+      string,
+      UrlRecord
+    >();
+
+  /*
+   * source|target → edge
+   */
+  const edgeMap =
+    new Map<
+      string,
+      CrawlEdge
+    >();
+
+  /*
+   * target URL → source URL listesi
+   */
+  const references =
+    new Map<
+      string,
+      Set<string>
+    >();
+
+  const failed:
+    FailedUrlRecord[] = [];
+
+  const externalUrls =
+    new Set<string>();
+
+  const visited =
+    new Set<string>();
+
+  const queued =
+    new Set<string>();
+
+  const queue:
+    QueueItem[] = [
+      {
+        url: normalizedRoot,
+        depth: 0,
+        discoveredFrom: null,
+      },
+    ];
+
+  queued.add(
+    normalizedRoot,
+  );
+
+  function getReferences(
+    target: string,
+  ): string[] {
+    return uniqueSorted([
+      ...(
+        references.get(
+          target,
+        ) ?? []
+      ),
+    ]);
+  }
+
+  function addReference(
+    source: string,
+    target: string,
+  ) {
+    if (
+      source === target
     ) {
-      const item = queue.shift()!;
+      return;
+    }
 
-      if (visited.has(item.url)) {
-        continue;
-      }
-
-      visited.add(item.url);
-
-      console.log('');
-      console.log(
-        `🌐 [${visited.size}/${options.maxPages}]`,
+    let sources =
+      references.get(
+        target,
       );
-      console.log(`   Depth : ${item.depth}`);
-      console.log(`   URL   : ${item.url}`);
 
-      try {
-        const response = await page.goto(
+    if (!sources) {
+      sources =
+        new Set<string>();
+
+      references.set(
+        target,
+        sources,
+      );
+    }
+
+    sources.add(source);
+  }
+
+  function addEdge(
+    source: string,
+    target: string,
+    type: ResourceType,
+  ) {
+    if (
+      source === target
+    ) {
+      return;
+    }
+
+    addReference(
+      source,
+      target,
+    );
+
+    const key =
+      `${source}\n${target}`;
+
+    const existing =
+      edgeMap.get(key);
+
+    /*
+     * Bir URL ilk anda HTML tahmin edilmiş,
+     * daha sonra Content-Type ile PDF/Image
+     * olduğu anlaşılmış olabilir.
+     */
+    if (existing) {
+      existing.type =
+        type;
+
+      return;
+    }
+
+    edgeMap.set(
+      key,
+      {
+        source,
+        target,
+        type,
+      },
+    );
+  }
+
+  function updateIncomingEdgeType(
+    item: QueueItem,
+    type: ResourceType,
+  ) {
+    if (
+      !item.discoveredFrom
+    ) {
+      return;
+    }
+
+    addEdge(
+      item.discoveredFrom,
+      item.url,
+      type,
+    );
+  }
+
+  function addOrUpdateRecord(
+    map: Map<
+      string,
+      UrlRecord
+    >,
+    record: UrlRecord,
+  ) {
+    const existing =
+      map.get(record.url);
+
+    const refs =
+      getReferences(
+        record.url,
+      );
+
+    if (!existing) {
+      map.set(
+        record.url,
+        {
+          ...record,
+
+          referencedBy:
+            mergeReferences(
+              record
+                .referencedBy,
+              refs,
+            ),
+        },
+      );
+
+      return;
+    }
+
+    existing.status =
+      record.status ??
+      existing.status;
+
+    existing.contentType =
+      record.contentType ||
+      existing.contentType;
+
+    existing.depth =
+      Math.min(
+        existing.depth,
+        record.depth,
+      );
+
+    existing.title =
+      record.title ??
+      existing.title;
+
+    existing.finalUrl =
+      record.finalUrl ??
+      existing.finalUrl;
+
+    existing.redirected =
+      record.redirected ??
+      existing.redirected;
+
+    existing.referencedBy =
+      mergeReferences(
+        existing.referencedBy,
+        refs,
+      );
+
+    if (
+      !existing.discoveredFrom &&
+      record.discoveredFrom
+    ) {
+      existing.discoveredFrom =
+        record.discoveredFrom;
+    }
+  }
+
+  function createProvisionalRecord(
+    url: string,
+    depth: number,
+    discoveredFrom: string,
+  ): UrlRecord {
+    return {
+      url,
+      status: null,
+      contentType: '',
+      discoveredFrom,
+      referencedBy:
+        getReferences(url),
+      depth,
+    };
+  }
+
+  while (
+    queue.length > 0 &&
+    visited.size <
+      options.maxPages
+  ) {
+    const item =
+      queue.shift();
+
+    if (!item) {
+      break;
+    }
+
+    if (
+      visited.has(
+        item.url,
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      item.depth >
+      options.maxDepth
+    ) {
+      continue;
+    }
+
+    visited.add(
+      item.url,
+    );
+
+    console.log(
+      `🌐 [${visited.size}/${options.maxPages}]`,
+    );
+
+    console.log(
+      `   Depth : ${item.depth}`,
+    );
+
+    console.log(
+      `   URL   : ${item.url}`,
+    );
+
+    try {
+      const response =
+        await page.goto(
           item.url,
           {
-            waitUntil: 'domcontentloaded',
-            timeout: options.timeoutMs,
+            waitUntil:
+              'domcontentloaded',
+
+            timeout:
+              options.timeoutMs,
           },
         );
 
-        /*
-         * JS framework hydration için kısa süre.
-         * Network idle zorunlu değil.
-         */
-        await page
-          .waitForLoadState('networkidle', {
-            timeout: 2_000,
-          })
-          .catch(() => undefined);
+      /*
+       * Dinamik sayfalar için kısa süre
+       * networkidle beklemeyi deniyoruz.
+       * Başarısız olması crawl'ı bozmaz.
+       */
+      await page
+        .waitForLoadState(
+          'networkidle',
+          {
+            timeout: 2000,
+          },
+        )
+        .catch(() => {
+          // ignore
+        });
 
-        await page
-          .waitForTimeout(200)
-          .catch(() => undefined);
+      await page
+        .waitForTimeout(200)
+        .catch(() => {
+          // ignore
+        });
 
-        const finalUrl =
-          normalizeUrl(page.url()) ?? item.url;
+      const status =
+        response
+          ? response.status()
+          : null;
 
-        const status = response?.status() ?? null;
+      const contentType =
+        response
+          ?.headers()[
+          'content-type'
+        ] ?? '';
 
-        const headers = response?.headers() ?? {};
+      const finalUrl =
+        normalizeUrl(
+          page.url(),
+          item.url,
+        ) ?? item.url;
 
-        const contentType =
-          headers['content-type'] ?? '';
+      const redirected =
+        finalUrl !==
+        item.url;
 
-        const resourceType =
-          response?.request().resourceType() ??
-          'document';
-
-        console.log(
-          `   Status: ${status ?? 'N/A'}`,
+      let type =
+        typeFromContentType(
+          contentType,
         );
 
-        console.log(
-          `   Type  : ${contentType || 'unknown'}`,
-        );
-
+      /*
+       * Content-Type hatalı veya boş
+       * dönen sitelerde extension
+       * üzerinden destekleyelim.
+       */
+      if (
+        type === 'other'
+      ) {
         if (
-          status !== null &&
-          status >= 400
+          isPdfUrl(
+            item.url,
+          )
         ) {
-          console.log(
-            `   ❌ HTTP ${status}`,
-          );
+          type = 'pdf';
+        } else if (
+          isImageUrl(
+            item.url,
+          )
+        ) {
+          type = 'image';
+        } else {
+          /*
+           * Browser gerçekten HTML
+           * oluşturmuş mu?
+           */
+          const htmlCount =
+            await page
+              .locator('html')
+              .count()
+              .catch(
+                () => 0,
+              );
 
-          failed.set(item.url, {
+          if (
+            htmlCount > 0
+          ) {
+            type = 'html';
+          }
+        }
+      }
+
+      console.log(
+        `   Status: ${status}`,
+      );
+
+      console.log(
+        `   Type  : ${
+          contentType ||
+          '(empty)'
+        }`,
+      );
+
+      updateIncomingEdgeType(
+        item,
+        type,
+      );
+
+      /*
+       * PDF
+       */
+      if (
+        type === 'pdf'
+      ) {
+        addOrUpdateRecord(
+          pdfMap,
+          {
             url: item.url,
+            status,
+            contentType,
             discoveredFrom:
               item.discoveredFrom,
-            depth: item.depth,
+            referencedBy:
+              getReferences(
+                item.url,
+              ),
+            depth:
+              item.depth,
+            finalUrl,
+            redirected,
+          },
+        );
+
+        console.log(
+          '   📄 PDF',
+        );
+
+        console.log('');
+
+        continue;
+      }
+
+      /*
+       * IMAGE
+       */
+      if (
+        type === 'image'
+      ) {
+        addOrUpdateRecord(
+          imageMap,
+          {
+            url: item.url,
             status,
-            error: `HTTP ${status}`,
-          });
+            contentType,
+            discoveredFrom:
+              item.discoveredFrom,
+            referencedBy:
+              getReferences(
+                item.url,
+              ),
+            depth:
+              item.depth,
+            finalUrl,
+            redirected,
+          },
+        );
+
+        console.log(
+          '   🖼️ IMAGE',
+        );
+
+        console.log('');
+
+        continue;
+      }
+
+      /*
+       * OTHER
+       */
+      if (
+        type !== 'html'
+      ) {
+        addOrUpdateRecord(
+          otherMap,
+          {
+            url: item.url,
+            status,
+            contentType,
+            discoveredFrom:
+              item.discoveredFrom,
+            referencedBy:
+              getReferences(
+                item.url,
+              ),
+            depth:
+              item.depth,
+            finalUrl,
+            redirected,
+          },
+        );
+
+        console.log(
+          '   ⚪ OTHER',
+        );
+
+        console.log('');
+
+        continue;
+      }
+
+      /*
+       * HTML
+       */
+      const title =
+        await page
+          .title()
+          .catch(
+            () => '',
+          );
+
+      addOrUpdateRecord(
+        htmlMap,
+        {
+          url: item.url,
+          status,
+          contentType,
+          discoveredFrom:
+            item.discoveredFrom,
+          referencedBy:
+            getReferences(
+              item.url,
+            ),
+          depth:
+            item.depth,
+          title,
+          finalUrl,
+          redirected,
+        },
+      );
+
+      console.log(
+        '   ✅ HTML',
+      );
+
+      console.log(
+        `   Title : ${
+          title ||
+          '(empty)'
+        }`,
+      );
+
+      /*
+       * IMAGES
+       */
+      const images =
+        await extractImages(
+          page,
+          finalUrl,
+        );
+
+      let internalImageCount =
+        0;
+
+      let externalImageCount =
+        0;
+
+      for (
+        const imageUrl of
+        images
+      ) {
+        if (
+          !isSameSite(
+            imageUrl,
+            rootUrl,
+            options.includeSubdomains,
+          )
+        ) {
+          externalUrls.add(
+            imageUrl,
+          );
+
+          externalImageCount++;
 
           continue;
         }
+
+        internalImageCount++;
+
+        addEdge(
+          item.url,
+          imageUrl,
+          'image',
+        );
+
+        addOrUpdateRecord(
+          imageMap,
+          createProvisionalRecord(
+            imageUrl,
+            item.depth + 1,
+            item.url,
+          ),
+        );
+      }
+
+      console.log(
+        `   🖼️ Images discovered: ${images.length}`,
+      );
+
+      console.log(
+        `      Internal: ${internalImageCount}`,
+      );
+
+      console.log(
+        `      External: ${externalImageCount}`,
+      );
+
+      /*
+       * LINKS
+       */
+      const links =
+        await extractLinks(
+          page,
+          finalUrl,
+        );
+
+      let internalCount = 0;
+
+      let externalCount = 0;
+
+      let pdfCount = 0;
+
+      let imageLinkCount =
+        0;
+
+      let queuedCount = 0;
+
+      for (
+        const link of links
+      ) {
+        if (
+          !isSameSite(
+            link,
+            rootUrl,
+            options.includeSubdomains,
+          )
+        ) {
+          externalUrls.add(
+            link,
+          );
+
+          externalCount++;
+
+          continue;
+        }
+
+        internalCount++;
+
+        const type =
+          guessedType(
+            link,
+          );
 
         /*
          * PDF
          */
         if (
-          looksLikePdf(finalUrl, contentType) ||
-          looksLikePdf(item.url, contentType)
+          type === 'pdf'
         ) {
-          console.log('   📄 PDF');
+          pdfCount++;
 
-          pdf.set(finalUrl, {
-            url: finalUrl,
-            status,
-            contentType,
-            discoveredFrom:
-              item.discoveredFrom,
-            depth: item.depth,
-          });
+          addEdge(
+            item.url,
+            link,
+            'pdf',
+          );
+
+          addOrUpdateRecord(
+            pdfMap,
+            createProvisionalRecord(
+              link,
+              item.depth + 1,
+              item.url,
+            ),
+          );
 
           continue;
         }
 
         /*
-         * IMAGE
+         * IMAGE link
          */
         if (
-          looksLikeImage(
-            finalUrl,
-            contentType,
-          ) ||
-          looksLikeImage(
+          type === 'image'
+        ) {
+          imageLinkCount++;
+
+          addEdge(
             item.url,
-            contentType,
+            link,
+            'image',
+          );
+
+          addOrUpdateRecord(
+            imageMap,
+            createProvisionalRecord(
+              link,
+              item.depth + 1,
+              item.url,
+            ),
+          );
+
+          continue;
+        }
+
+        /*
+         * HTML link
+         */
+        addEdge(
+          item.url,
+          link,
+          'html',
+        );
+
+        if (
+          item.depth + 1 >
+          options.maxDepth
+        ) {
+          continue;
+        }
+
+        if (
+          visited.has(
+            link,
+          ) ||
+          queued.has(
+            link,
           )
         ) {
-          console.log('   🖼️ IMAGE');
-
-          images.set(finalUrl, {
-            url: finalUrl,
-            status,
-            contentType,
-            discoveredFrom:
-              item.discoveredFrom,
-            depth: item.depth,
-          });
-
           continue;
         }
 
-        /*
-         * HTML kontrolü
-         *
-         * Burada önceki sürüm çok katıydı.
-         */
-        const htmlPage = await isHtmlPage(
-          page,
-          contentType,
-          resourceType,
+        queued.add(
+          link,
         );
 
-        if (!htmlPage) {
-          console.log(
-            '   ⚪ OTHER CONTENT',
-          );
-
-          other.set(finalUrl, {
-            url: finalUrl,
-            status,
-            contentType,
-            discoveredFrom:
-              item.discoveredFrom,
-            depth: item.depth,
-          });
-
-          continue;
-        }
-
-        const title = await page
-          .title()
-          .catch(() => '');
-
-        html.set(finalUrl, {
-          url: finalUrl,
-          status,
-          contentType,
+        queue.push({
+          url: link,
+          depth:
+            item.depth + 1,
           discoveredFrom:
-            item.discoveredFrom,
-          depth: item.depth,
-          title,
+            item.url,
         });
 
-        console.log(`   ✅ HTML`);
-        console.log(
-          `   Title : ${title || '-'}`,
-        );
-
-        /*
-         * =============================
-         * IMAGE DISCOVERY
-         * =============================
-         */
-
-        const discoveredImages =
-          await extractImages(
-            page,
-            finalUrl,
-          );
-
-        let internalImageCount = 0;
-        let externalImageCount = 0;
-
-        for (const imageUrl of discoveredImages) {
-          const parsed = new URL(imageUrl);
-
-          if (
-            !isSameSite(
-              parsed,
-              root,
-              options.includeSubdomains,
-            )
-          ) {
-            external.add(imageUrl);
-            externalImageCount++;
-            continue;
-          }
-
-          internalImageCount++;
-
-          if (!images.has(imageUrl)) {
-            images.set(imageUrl, {
-              url: imageUrl,
-              status: null,
-              contentType:
-                'image/* (discovered from DOM)',
-              discoveredFrom: finalUrl,
-              depth: item.depth + 1,
-            });
-          }
-        }
-
-        console.log(
-          `   🖼️ Images: ${discoveredImages.length}` +
-            ` | Internal: ${internalImageCount}` +
-            ` | External: ${externalImageCount}`,
-        );
-
-        /*
-         * Max depth'e geldiysek
-         * buradan sonrasını crawl etme.
-         */
-        if (item.depth >= options.maxDepth) {
-          console.log(
-            '   ⛔ Max depth reached',
-          );
-
-          continue;
-        }
-
-        /*
-         * =============================
-         * LINK DISCOVERY
-         * =============================
-         */
-
-        const links = await extractLinks(
-          page,
-          finalUrl,
-        );
-
-        console.log(
-          `   🔗 Links discovered: ${links.length}`,
-        );
-
-        let internalLinks = 0;
-        let externalLinks = 0;
-        let queuedLinks = 0;
-        let pdfLinks = 0;
-        let imageLinks = 0;
-
-        for (const link of links) {
-          const parsed = new URL(link);
-
-          /*
-           * External
-           */
-          if (
-            !isSameSite(
-              parsed,
-              root,
-              options.includeSubdomains,
-            )
-          ) {
-            external.add(link);
-            externalLinks++;
-            continue;
-          }
-
-          internalLinks++;
-
-          /*
-           * PDF
-           */
-          if (looksLikePdf(link)) {
-            pdfLinks++;
-
-            if (!pdf.has(link)) {
-              pdf.set(link, {
-                url: link,
-                status: null,
-                contentType:
-                  'application/pdf (inferred from URL)',
-                discoveredFrom: finalUrl,
-                depth: item.depth + 1,
-              });
-            }
-
-            continue;
-          }
-
-          /*
-           * IMAGE
-           */
-          if (looksLikeImage(link)) {
-            imageLinks++;
-
-            if (!images.has(link)) {
-              images.set(link, {
-                url: link,
-                status: null,
-                contentType:
-                  'image/* (inferred from URL)',
-                discoveredFrom: finalUrl,
-                depth: item.depth + 1,
-              });
-            }
-
-            continue;
-          }
-
-          /*
-           * HTML adayını queue'ya ekle.
-           */
-          if (
-            !queued.has(link) &&
-            !visited.has(link)
-          ) {
-            queued.add(link);
-
-            queue.push({
-              url: link,
-              depth: item.depth + 1,
-              discoveredFrom: finalUrl,
-            });
-
-            queuedLinks++;
-          }
-        }
-
-        console.log(
-          `   ├─ Internal : ${internalLinks}`,
-        );
-
-        console.log(
-          `   ├─ External : ${externalLinks}`,
-        );
-
-        console.log(
-          `   ├─ PDF      : ${pdfLinks}`,
-        );
-
-        console.log(
-          `   ├─ Images   : ${imageLinks}`,
-        );
-
-        console.log(
-          `   └─ Queued   : ${queuedLinks}`,
-        );
-
-        console.log(
-          `   📥 Queue size: ${queue.length}`,
-        );
-      } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : String(error);
-
-        console.log(
-          `   ❌ ERROR: ${message}`,
-        );
-
-        failed.set(item.url, {
-          url: item.url,
-          discoveredFrom:
-            item.discoveredFrom,
-          depth: item.depth,
-          status: null,
-          error: message,
-        });
+        queuedCount++;
       }
+
+      console.log(
+        `   🔗 Links discovered: ${links.length}`,
+      );
+
+      console.log(
+        `      Internal: ${internalCount}`,
+      );
+
+      console.log(
+        `      External: ${externalCount}`,
+      );
+
+      console.log(
+        `      PDF     : ${pdfCount}`,
+      );
+
+      console.log(
+        `      Images  : ${imageLinkCount}`,
+      );
+
+      console.log(
+        `      Queued  : ${queuedCount}`,
+      );
+
+      console.log(
+        `   📥 Queue size: ${queue.length}`,
+      );
+
+      console.log(
+        `   🕸️ Edges: ${edgeMap.size}`,
+      );
+
+      console.log('');
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      console.log(
+        `   ❌ ERROR: ${message}`,
+      );
+
+      const status =
+        null;
+
+      const failedRecord:
+        FailedUrlRecord = {
+          url: item.url,
+
+          discoveredFrom:
+            item.discoveredFrom,
+
+          referencedBy:
+            getReferences(
+              item.url,
+            ),
+
+          depth:
+            item.depth,
+
+          status,
+
+          error:
+            message,
+        };
+
+      failed.push(
+        failedRecord,
+      );
+
+      console.log('');
     }
-  } finally {
-    await context.close();
-    await browser.close();
   }
 
   /*
-   * =============================
-   * RESULT
-   * =============================
+   * Son aşamada referencedBy alanlarını
+   * güncelliyoruz.
+   *
+   * Çünkü bir URL ilk bulunduğunda tek
+   * referansı olabilirken ilerleyen
+   * sayfalarda başka referanslar da
+   * keşfedilmiş olabilir.
    */
+  for (
+    const map of [
+      htmlMap,
+      pdfMap,
+      imageMap,
+      otherMap,
+    ]
+  ) {
+    for (
+      const record of
+      map.values()
+    ) {
+      record.referencedBy =
+        getReferences(
+          record.url,
+        );
 
-  const htmlRecords = [...html.values()].sort(
-    (a, b) => a.url.localeCompare(b.url),
-  );
+      if (
+        !record.discoveredFrom &&
+        record
+          .referencedBy
+          .length > 0
+      ) {
+        record.discoveredFrom =
+          record
+            .referencedBy[0];
+      }
+    }
+  }
 
-  const pdfRecords = [...pdf.values()].sort(
-    (a, b) => a.url.localeCompare(b.url),
-  );
+  for (
+    const fail of failed
+  ) {
+    fail.referencedBy =
+      getReferences(
+        fail.url,
+      );
+  }
 
-  const imageRecords = [
-    ...images.values(),
-  ].sort((a, b) =>
-    a.url.localeCompare(b.url),
-  );
+  const html =
+    [...htmlMap.values()]
+      .sort((a, b) =>
+        a.url.localeCompare(
+          b.url,
+        ),
+      );
 
-  const failedRecords = [
-    ...failed.values(),
-  ].sort((a, b) =>
-    a.url.localeCompare(b.url),
-  );
+  const pdf =
+    [...pdfMap.values()]
+      .sort((a, b) =>
+        a.url.localeCompare(
+          b.url,
+        ),
+      );
 
-  const otherRecords = [
-    ...other.values(),
-  ].sort((a, b) =>
-    a.url.localeCompare(b.url),
-  );
+  const images =
+    [...imageMap.values()]
+      .sort((a, b) =>
+        a.url.localeCompare(
+          b.url,
+        ),
+      );
 
-  const externalUrls = uniqueSorted(external);
+  const otherUrls =
+    [...otherMap.values()]
+      .sort((a, b) =>
+        a.url.localeCompare(
+          b.url,
+        ),
+      );
 
-  return {
-    generatedAt: new Date().toISOString(),
+  const edges =
+    [...edgeMap.values()]
+      .sort((a, b) => {
+        const sourceCompare =
+          a.source.localeCompare(
+            b.source,
+          );
 
-    rootUrl: options.rootUrl,
+        if (
+          sourceCompare !== 0
+        ) {
+          return sourceCompare;
+        }
 
-    options: {
-      maxPages: options.maxPages,
-      maxDepth: options.maxDepth,
-      timeoutMs: options.timeoutMs,
-      includeSubdomains:
-        options.includeSubdomains,
-      ignoreHttpsErrors:
-        options.ignoreHttpsErrors,
-    },
+        return a.target.localeCompare(
+          b.target,
+        );
+      });
 
-    summary: {
-      visitedCount: visited.size,
-      htmlCount: htmlRecords.length,
-      pdfCount: pdfRecords.length,
-      imageCount: imageRecords.length,
-      failedCount: failedRecords.length,
-      externalCount: externalUrls.length,
-      otherCount: otherRecords.length,
-    },
+  const result:
+    CrawlResult = {
+      generatedAt:
+        new Date()
+          .toISOString(),
 
-    htmlUrls: htmlRecords.map(
-      (record) => record.url,
-    ),
+      rootUrl:
+        normalizedRoot,
 
-    pdfUrls: pdfRecords.map(
-      (record) => record.url,
-    ),
+      options: {
+        maxPages:
+          options.maxPages,
 
-    imageUrls: imageRecords.map(
-      (record) => record.url,
-    ),
+        maxDepth:
+          options.maxDepth,
 
-    html: htmlRecords,
-    pdf: pdfRecords,
-    images: imageRecords,
-    failed: failedRecords,
-    externalUrls,
-    otherUrls: otherRecords,
-  };
-}
+        timeoutMs:
+          options.timeoutMs,
 
-async function main(): Promise<void> {
-  const options = parseArgs(
-    process.argv.slice(2),
-  );
+        includeSubdomains:
+          options.includeSubdomains,
 
-  const result = await crawl(options);
+        ignoreHttpsErrors:
+          options.ignoreHttpsErrors,
+      },
 
-  const outputPath = path.resolve(
-    options.output,
-  );
+      summary: {
+        visitedCount:
+          visited.size,
+
+        htmlCount:
+          html.length,
+
+        pdfCount:
+          pdf.length,
+
+        imageCount:
+          images.length,
+
+        failedCount:
+          failed.length,
+
+        externalCount:
+          externalUrls.size,
+
+        otherCount:
+          otherUrls.length,
+
+        edgeCount:
+          edges.length,
+      },
+
+      htmlUrls:
+        html.map(
+          (item) =>
+            item.url,
+        ),
+
+      pdfUrls:
+        pdf.map(
+          (item) =>
+            item.url,
+        ),
+
+      imageUrls:
+        images.map(
+          (item) =>
+            item.url,
+        ),
+
+      html,
+
+      pdf,
+
+      images,
+
+      failed,
+
+      externalUrls:
+        uniqueSorted([
+          ...externalUrls,
+        ]),
+
+      otherUrls,
+
+      edges,
+    };
 
   await fs.mkdir(
-    path.dirname(outputPath),
+    path.dirname(
+      options.output,
+    ),
     {
       recursive: true,
     },
   );
 
   await fs.writeFile(
-    outputPath,
-    `${JSON.stringify(
+    options.output,
+    JSON.stringify(
       result,
       null,
       2,
-    )}\n`,
-    'utf8',
+    ),
+    'utf-8',
   );
 
-  console.log('\n');
-  console.log('================================');
-  console.log(' CRAWL COMPLETED');
-  console.log('================================');
+  await browser.close();
+
+  console.log('');
+  console.log(
+    '================================',
+  );
+  console.log(
+    ' CRAWL COMPLETED',
+  );
+  console.log(
+    '================================',
+  );
 
   console.log(
     `Visited  : ${result.summary.visitedCount}`,
@@ -1113,6 +1798,10 @@ async function main(): Promise<void> {
   );
 
   console.log(
+    `Edges    : ${result.summary.edgeCount}`,
+  );
+
+  console.log(
     `Failed   : ${result.summary.failedCount}`,
   );
 
@@ -1124,23 +1813,27 @@ async function main(): Promise<void> {
     `Other    : ${result.summary.otherCount}`,
   );
 
-  console.log('--------------------------------');
+  console.log(
+    '--------------------------------',
+  );
 
   console.log(
-    `Output   : ${outputPath}`,
+    `Output   : ${options.output}`,
   );
 
-  console.log('================================');
+  console.log(
+    '================================',
+  );
+
+  console.log('');
 }
 
-main().catch((error) => {
-  console.error('\nCrawler failed:');
+main().catch(
+  (error) => {
+    console.error(
+      error,
+    );
 
-  console.error(
-    error instanceof Error
-      ? error.stack
-      : error,
-  );
-
-  process.exitCode = 1;
-});
+    process.exit(1);
+  },
+);

@@ -1,26 +1,81 @@
-import { defineConfig } from '@playwright/test';
+import {
+  defineConfig,
+} from '@playwright/test';
+
+function envBoolean(
+  value: string | undefined,
+  defaultValue = false,
+): boolean {
+  if (value === undefined) {
+    return defaultValue;
+  }
+
+  return [
+    'true',
+    '1',
+    'yes',
+    'on',
+  ].includes(
+    value.toLowerCase(),
+  );
+}
 
 export default defineConfig({
   testDir: './tests',
+
   fullyParallel: true,
-  timeout: Number(process.env.TEST_TIMEOUT ?? 60_000),
+
+  workers: Number(
+    process.env.PW_WORKERS ?? 4,
+  ),
+
+  retries: Number(
+    process.env.PW_RETRIES ?? 1,
+  ),
+
+  timeout: Number(
+    process.env.TEST_TIMEOUT ??
+      60_000,
+  ),
+
   expect: {
     timeout: 10_000,
   },
-  retries: Number(process.env.RETRIES ?? 1),
-  workers: Number(process.env.WORKERS ?? 4),
-  reporter: [
-    ['list'],
-    ['html', { outputFolder: 'playwright-report', open: 'never' }],
-  ],
+
   use: {
-    browserName: 'chromium',
-    headless: process.env.HEADLESS !== 'false',
-    ignoreHTTPSErrors: process.env.IGNORE_HTTPS_ERRORS === 'true',
-    navigationTimeout: Number(process.env.NAVIGATION_TIMEOUT ?? 30_000),
-    actionTimeout: 15_000,
+    ignoreHTTPSErrors:
+      envBoolean(
+        process.env
+          .IGNORE_HTTPS_ERRORS,
+      ),
+
     trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
   },
-  outputDir: 'test-results',
+
+  outputDir:
+    'test-results',
+
+  reporter: [
+    [
+      'list',
+    ],
+
+    [
+      'html',
+      {
+        outputFolder:
+          'playwright-report',
+
+        open: 'never',
+      },
+    ],
+
+    [
+      'json',
+      {
+        outputFile:
+          'data/test-results.json',
+      },
+    ],
+  ],
 });

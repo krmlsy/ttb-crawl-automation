@@ -4,17 +4,18 @@
   "private": true,
   "type": "module",
   "description": "Crawl a website with Playwright, export HTML/PDF URLs to JSON, then validate them with Playwright tests.",
-"scripts": {
-  "crawl": "tsx src/crawler.ts",
-  "test": "playwright test",
-  "test:html": "playwright test tests/html-urls.spec.ts",
-  "test:pdf": "playwright test tests/pdf-urls.spec.ts",
-  "test:images": "playwright test tests/image-urls.spec.ts",
-  "test:list": "playwright test --list",
-  "report": "playwright show-report",
-  "install:browsers": "playwright install chromium",
-  "typecheck": "tsc --noEmit"
-},
+  "scripts": {
+    "crawl": "tsx src/crawler.ts",
+    "test": "playwright test",
+    "test:html": "playwright test tests/html-urls.spec.ts",
+    "test:pdf": "playwright test tests/pdf-urls.spec.ts",
+    "test:images": "playwright test tests/image-urls.spec.ts",
+    "test:list": "playwright test --list",
+    "report": "playwright show-report",
+    "install:browsers": "playwright install chromium",
+    "typecheck": "tsc --noEmit",
+    "report:site": "tsx src/report-generator.ts"
+  },
   "devDependencies": {
     "@playwright/test": "1.63.0",
     "@types/node": "^24.0.0",
