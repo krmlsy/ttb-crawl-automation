@@ -193,3 +193,16 @@ npm run crawl -- --url https://www.turkticaretbankasi.com.tr/
 npm test
 npm run report
 ```
+
+1-crawl
+IGNORE_HTTPS_ERRORS=true npm run crawl -- \
+  --url https://www.turkticaretbankasi.com.tr/ \
+  --max-pages 2000 \
+  --max-depth 15 \
+  --timeout 45000
+
+2-test
+IGNORE_HTTPS_ERRORS=true npm test
+
+3-report
+npm run report:site 
